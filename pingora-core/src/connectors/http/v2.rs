@@ -387,7 +387,8 @@ impl Connector {
         settings.ping_interval = peer.h2_ping_interval();
         settings.stream_window_size = peer_options.and_then(|o| o.h2_stream_window_size);
         settings.connection_window_size = peer_options.and_then(|o| o.h2_connection_window_size);
-        let conn = handshake(stream, settings).await?;
+        // Boxed for the same reason as connecting in `TransportConnector::new_stream`.
+        let conn = Box::pin(handshake(stream, settings)).await?;
         let h2_stream = conn.spawn_stream().await?.or_err(
             H2Error,
             "newly created connection has no free streams (server may have sent GOAWAY)",

@@ -506,16 +506,17 @@ where
                     }
                     ClientSession::Custom(mut c) => {
                         let mut request_write_attempted = false;
-                        let (server_reused, error) = self
-                            .proxy_to_custom_upstream(
-                                session,
-                                &mut c,
-                                client_reused,
-                                &peer,
-                                ctx,
-                                &mut request_write_attempted,
-                            )
-                            .await;
+                        // Boxed: custom protocols are rare, and their future is the largest
+                        // here, which every request would otherwise make room for.
+                        let (server_reused, error) = Box::pin(self.proxy_to_custom_upstream(
+                            session,
+                            &mut c,
+                            client_reused,
+                            &peer,
+                            ctx,
+                            &mut request_write_attempted,
+                        ))
+                        .await;
                         if request_write_attempted
                             && error.as_ref().is_some_and(|e| {
                                 session.downstream_abandoned_during_cache_fill()
@@ -2165,7 +2166,9 @@ where
                 .on_connection_reuse(&mut session, &mut ctx, prev_ctx);
         }
 
-        self.process_request(session, ctx).await
+        // Boxed once the request header is in: a connection that waits for its next request
+        // then holds only the small future of reading it, not the one of proxying.
+        Box::pin(self.process_request(session, ctx)).await
     }
 
     async fn http_cleanup(&self) {

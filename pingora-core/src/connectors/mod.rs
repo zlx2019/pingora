@@ -264,7 +264,17 @@ impl TransportConnector {
             .await
             .or_err(InternalError, "offload runtime failure")??
         } else {
-            do_connect(peer, bind_to, alpn_override, &self.tls_ctx.ctx, None).await?
+            // Boxed: connecting, with its TLS handshake, needs several KiB, which every future
+            // that might connect would otherwise hold for its whole life, even when a pooled
+            // connection is reused.
+            Box::pin(do_connect(
+                peer,
+                bind_to,
+                alpn_override,
+                &self.tls_ctx.ctx,
+                None,
+            ))
+            .await?
         };
 
         Ok(stream)
