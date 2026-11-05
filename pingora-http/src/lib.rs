@@ -43,7 +43,7 @@ use authority::{raw_target_authority, RawTargetAuthority};
 
 mod case_header_name;
 use case_header_name::CaseHeaderName;
-pub use case_header_name::IntoCaseHeaderName;
+pub use case_header_name::{CasedHeaderName, IntoCaseHeaderName};
 
 pub mod prelude {
     pub use crate::RequestHeader;
@@ -251,6 +251,16 @@ impl RequestHeader {
             &mut self.base.headers,
             name,
             header_value,
+        )
+    }
+
+    /// Reserve room for at least `additional` more headers, so that adding them does not grow
+    /// the header maps one step at a time.
+    pub fn reserve(&mut self, additional: usize) -> Result<()> {
+        reserve_headers(
+            self.header_name_map.as_mut(),
+            &mut self.base.headers,
+            additional,
         )
     }
 
@@ -608,6 +618,16 @@ impl ResponseHeader {
         )
     }
 
+    /// Reserve room for at least `additional` more headers, so that adding them does not grow
+    /// the header maps one step at a time.
+    pub fn reserve(&mut self, additional: usize) -> Result<()> {
+        reserve_headers(
+            self.header_name_map.as_mut(),
+            &mut self.base.headers,
+            additional,
+        )
+    }
+
     /// Remove all headers under the name
     pub fn remove_header<'a, N: ?Sized>(&mut self, name: &'a N) -> Option<HeaderValue>
     where
@@ -875,10 +895,8 @@ fn append_header_value<T>(
     name: impl IntoCaseHeaderName,
     value: T,
 ) -> Result<bool> {
-    let case_header_name = name.into_case_header_name();
-    let header_name: HeaderName = case_header_name
-        .as_slice()
-        .try_into()
+    let (header_name, case_header_name) = name
+        .into_name_and_case()
         .or_err(InvalidHTTPHeader, "invalid header name")?;
     // store the original case in the map
     if let Some(name_map) = name_map {
@@ -904,10 +922,8 @@ fn insert_header_value<T>(
     name: impl IntoCaseHeaderName,
     value: T,
 ) -> Result<()> {
-    let case_header_name = name.into_case_header_name();
-    let header_name: HeaderName = case_header_name
-        .as_slice()
-        .try_into()
+    let (header_name, case_header_name) = name
+        .into_name_and_case()
         .or_err(InvalidHTTPHeader, "invalid header name")?;
     if let Some(name_map) = name_map {
         // store the original case in the map
@@ -915,6 +931,23 @@ fn insert_header_value<T>(
     }
     value_map.insert(header_name, value);
     Ok(())
+}
+
+#[inline]
+fn reserve_headers<T>(
+    name_map: Option<&mut CaseMap>,
+    value_map: &mut HMap<T>,
+    additional: usize,
+) -> Result<()> {
+    if let Some(name_map) = name_map {
+        name_map
+            .try_reserve(additional)
+            .or_err(InvalidHTTPHeader, "header name map size overflows MAX_SIZE")?;
+    }
+    value_map.try_reserve(additional).or_err(
+        InvalidHTTPHeader,
+        "header value map size overflows MAX_SIZE",
+    )
 }
 
 // the &N here is to avoid clone(). None Copy type like String can impl AsHeaderName
@@ -1083,6 +1116,25 @@ mod tests {
         assert_eq!(8, http_header_map_upper_bound(None));
         assert_eq!(16, http_header_map_upper_bound(Some(16)));
         assert_eq!(4096, http_header_map_upper_bound(Some(7777)));
+    }
+
+    #[test]
+    fn test_cased_header_name_and_reserve() {
+        static X_FOO: CasedHeaderName = CasedHeaderName::from_static("x-foo", "X-Foo");
+        let mut req = RequestHeader::build("GET", b"/", None).unwrap();
+        req.reserve(2).unwrap();
+        assert!(req.headers.capacity() >= 2);
+        req.insert_header(&X_FOO, "a").unwrap();
+        req.append_header(&X_FOO, "b").unwrap();
+        let mut buf: Vec<u8> = vec![];
+        req.header_to_h1_wire(&mut buf);
+        assert_eq!(buf, b"X-Foo: a\r\nX-Foo: b\r\n");
+
+        let mut resp = ResponseHeader::new(None);
+        resp.reserve(1).unwrap();
+        resp.insert_header(&X_FOO, "c").unwrap();
+        assert_eq!(resp.headers["x-foo"], "c");
+        assert!(resp.reserve(usize::MAX).is_err());
     }
 
     #[test]
