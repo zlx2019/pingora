@@ -31,17 +31,16 @@ use crate::upstreams::peer::{Peer, ALPN};
 use crate::offload::OffloadRuntime;
 pub use l4::Connect as L4Connect;
 use l4::{connect as l4_connect, BindTo};
-use log::{debug, error, warn};
+use log::{debug, warn};
 use parking_lot::RwLock;
 use pingora_error::{Error, ErrorType::*, OrErr, Result};
 use pingora_pool::{ConnectionMeta, ConnectionPool};
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tls::TlsConnector;
-use tokio::sync::{Mutex, OwnedMutexGuard};
 
 #[derive(Clone, Debug)]
 pub(crate) struct IdleConnection {
@@ -189,11 +188,45 @@ mod response_parser_config_tests {
     }
 }
 
+/// How often the idle connections of a [TransportConnector] are checked, to close the ones whose
+/// idle timeout ended or that the server closed.
+const SWEEP_INTERVAL: Duration = Duration::from_secs(1);
+
+/// A connection in the keep-alive pool of a [TransportConnector].
+struct IdleStream {
+    stream: Stream,
+    /// When it was released to the pool.
+    since: Instant,
+    /// When its idle timeout ends, if it has one.
+    expires: Option<Instant>,
+}
+
+impl IdleStream {
+    /// Whether its idle timeout ended by `now`.
+    fn expired(&self, now: Instant) -> bool {
+        self.expires.is_some_and(|expires| expires <= now)
+    }
+}
+
+/// Clears the flag of the task that sweeps the keep-alive pool when the task ends, also when its
+/// runtime drops it.
+struct Sweeping(Arc<AtomicBool>);
+
+impl Drop for Sweeping {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
 /// [TransportConnector] provides APIs to connect to servers via TCP or TLS with connection reuse
 pub struct TransportConnector {
     tls_ctx: tls::Connector,
-    /// The stream is taken out of the `Option` when the connection is reused.
-    connection_pool: Arc<ConnectionPool<Arc<Mutex<Option<Stream>>>>>,
+    /// Nothing watches the idle connections: they are checked when picked up, and swept every
+    /// [SWEEP_INTERVAL]. A task per idle connection would cost every request a spawn, and the
+    /// pickup a handoff from that task.
+    connection_pool: Arc<ConnectionPool<IdleStream>>,
+    /// Whether the task that sweeps `connection_pool` runs.
+    sweeping: Arc<AtomicBool>,
     offload: Option<OffloadRuntime>,
     bind_to_v4: Vec<SocketAddr>,
     bind_to_v6: Vec<SocketAddr>,
@@ -227,6 +260,7 @@ impl TransportConnector {
         TransportConnector {
             tls_ctx: tls::Connector::new(options),
             connection_pool: Arc::new(ConnectionPool::new(pool_size)),
+            sweeping: Arc::new(AtomicBool::new(false)),
             offload: offload.map(|v| OffloadRuntime::new("upstream connect offload", v.0, v.1)),
             bind_to_v4,
             bind_to_v6,
@@ -282,59 +316,39 @@ impl TransportConnector {
 
     /// Try to find a reusable connection to the given server [Peer]
     pub async fn reused_stream<P: Peer + Send + Sync>(&self, peer: &P) -> Option<Stream> {
-        match self.connection_pool.get(&peer.reuse_hash()) {
-            Some(s) => {
-                debug!("find reusable stream, trying to acquire it");
-                // Wait for the idle poll to release the stream, then move it out under the lock.
-                // The idle poll's guard keeps its own `Arc` for a moment after unlocking, so
-                // `Arc::try_unwrap` here could still see a second owner.
-                let stream = s.lock().await.take();
-                match stream {
-                    Some(mut stream) => {
-                        // test_reusable_stream: we assume server would never actively send data
-                        // first on an idle stream.
-                        #[cfg(unix)]
-                        if peer.matches_fd(stream.id())
-                            && test_reusable_stream(&mut stream, &self.unexpected_data_conn_count)
-                        {
-                            Some(stream)
-                        } else {
-                            None
-                        }
-                        #[cfg(windows)]
-                        {
-                            use std::os::windows::io::{AsRawSocket, RawSocket};
-                            struct WrappedRawSocket(RawSocket);
-                            impl AsRawSocket for WrappedRawSocket {
-                                fn as_raw_socket(&self) -> RawSocket {
-                                    self.0
-                                }
-                            }
-                            if peer.matches_sock(WrappedRawSocket(stream.id() as RawSocket))
-                                && test_reusable_stream(
-                                    &mut stream,
-                                    &self.unexpected_data_conn_count,
-                                )
-                            {
-                                Some(stream)
-                            } else {
-                                None
-                            }
-                        }
-                    }
-                    None => {
-                        // Unreachable: `pool.get()` hands each pooled entry to exactly one caller,
-                        // and only this function takes the stream out of the slot.
-                        error!("reusable stream was already taken");
-                        None
-                    }
-                }
+        let (key, now) = (peer.reuse_hash(), Instant::now());
+        // Idle connections are not watched: drop the ones that timed out or went bad meanwhile.
+        while let Some(mut idle) = self.connection_pool.get(&key) {
+            if idle.expired(now) {
+                debug!("Idle connection timed out");
+                continue;
             }
-            None => {
-                debug!("No reusable connection found for {peer}");
-                None
+            if self.reusable(peer, &mut idle.stream) {
+                return Some(idle.stream);
             }
         }
+        debug!("No reusable connection found for {peer}");
+        None
+    }
+
+    /// Whether `stream`, taken from the pool, still leads to `peer` and can be reused.
+    fn reusable<P: Peer>(&self, peer: &P, stream: &mut Stream) -> bool {
+        #[cfg(unix)]
+        let matches = peer.matches_fd(stream.id());
+        #[cfg(windows)]
+        let matches = {
+            use std::os::windows::io::{AsRawSocket, RawSocket};
+            struct WrappedRawSocket(RawSocket);
+            impl AsRawSocket for WrappedRawSocket {
+                fn as_raw_socket(&self) -> RawSocket {
+                    self.0
+                }
+            }
+            peer.matches_sock(WrappedRawSocket(stream.id() as RawSocket))
+        };
+        // test_reusable_stream: we assume server would never actively send data first on an
+        // idle stream.
+        matches && test_reusable_stream(stream, &self.unexpected_data_conn_count)
     }
 
     /// Return the [Stream] to the [TransportConnector] for connection reuse.
@@ -353,36 +367,45 @@ impl TransportConnector {
         if !test_reusable_stream(&mut stream, &self.unexpected_data_conn_count) {
             return;
         }
-        let id = stream.id();
-        let meta = ConnectionMeta::new(key, id);
+        let meta = ConnectionMeta::new(key, stream.id());
         debug!("Try to keepalive client session");
-        let pooled = Arc::new(Mutex::new(None));
-        let locked_stream = OwnedMutexGuard::map(
-            pooled
-                .clone()
-                .try_lock_owned()
-                .expect("newly created mutex must be unlocked"),
-            |slot| slot.insert(stream),
-        );
-        let (notify_close, watch_use) = self.connection_pool.put(&meta, pooled);
-        let idle_meta = IdleConnection::new(meta);
-        let pool = self.connection_pool.clone(); //clone the arc
-        let keepalive_pool_callback = self.keepalive_pool_callback.clone();
-        let rt = pingora_runtime::current_handle();
-        rt.spawn(async move {
-            if pool
-                .idle_poll(
-                    locked_stream,
-                    &idle_meta.connection,
-                    idle_timeout,
-                    notify_close,
-                    watch_use,
-                )
-                .await
-            {
-                if let Some(callback) = keepalive_pool_callback {
-                    callback(idle_meta.elapsed());
-                }
+        let since = Instant::now();
+        let expires = idle_timeout.and_then(|timeout| since.checked_add(timeout));
+        let idle = IdleStream {
+            stream,
+            since,
+            expires,
+        };
+        let evicted = self.connection_pool.put_unwatched(&meta, idle);
+        if let Some(callback) = &self.keepalive_pool_callback {
+            for idle in &evicted {
+                callback(idle.since.elapsed());
+            }
+        }
+        self.sweep();
+    }
+
+    /// Starts the task that closes the idle connections whose idle timeout ended or that went
+    /// bad, unless it runs already. It ends when the connector is dropped.
+    fn sweep(&self) {
+        if self.sweeping.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let running = Sweeping(self.sweeping.clone());
+        let pool = Arc::downgrade(&self.connection_pool);
+        let unexpected_data_conn_count = self.unexpected_data_conn_count.clone();
+        pingora_runtime::current_handle().spawn(async move {
+            let _running = running;
+            loop {
+                pingora_timeout::sleep(SWEEP_INTERVAL).await;
+                let Some(pool) = pool.upgrade() else {
+                    return;
+                };
+                let now = Instant::now();
+                pool.retain(|idle| {
+                    !idle.expired(now)
+                        && test_reusable_stream(&mut idle.stream, &unexpected_data_conn_count)
+                });
             }
         });
     }
@@ -711,76 +734,92 @@ mod tests {
         server_handle.await.unwrap();
     }
 
-    /// Wakes the test when the idle watcher's unlock wakes the pickup, then blocks the
-    /// watcher's thread until the test has polled the pickup again.
-    struct StallingWaker {
-        woken: std::sync::mpsc::SyncSender<()>,
-        resume: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
-    }
-
-    impl std::task::Wake for StallingWaker {
-        fn wake(self: Arc<Self>) {
-            self.wake_by_ref();
-        }
-
-        fn wake_by_ref(self: &Arc<Self>) {
-            let _ = self.woken.send(());
-            let _ = self.resume.lock().unwrap().recv();
-        }
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_reuse_stream_while_idle_watcher_is_unlocking() {
-        use std::future::Future;
-        use std::task::{Context, Poll, Waker};
-
-        // An upstream that accepts connections and never writes to them, so a pooled
-        // connection always stays reusable.
+    /// An upstream that accepts connections and keeps them without writing. Returns the peer and
+    /// the accepted connections.
+    async fn silent_upstream() -> (
+        BasicPeer,
+        tokio::sync::mpsc::UnboundedReceiver<tokio::net::TcpStream>,
+    ) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let peer = BasicPeer::new(&listener.local_addr().unwrap().to_string());
+        let (accepted_tx, accepted) = tokio::sync::mpsc::unbounded_channel();
         tokio::spawn(async move {
-            let mut accepted = Vec::new();
             while let Ok((stream, _)) = listener.accept().await {
-                accepted.push(stream);
+                if accepted_tx.send(stream).is_err() {
+                    return;
+                }
             }
         });
+        (peer, accepted)
+    }
 
+    #[tokio::test]
+    async fn test_reuse_released_stream() {
+        let (peer, _accepted) = silent_upstream().await;
         let connector = TransportConnector::new(None);
-        let mut stream = connector.new_stream(&peer).await.unwrap();
-        for _ in 0..100 {
-            connector.release_stream(stream, peer.reuse_hash(), None);
+        let stream = connector.new_stream(&peer).await.unwrap();
+        let id = stream.id();
+        connector.release_stream(stream, peer.reuse_hash(), None);
 
-            let (woken_tx, woken_rx) = std::sync::mpsc::sync_channel(1);
-            let (resume_tx, resume_rx) = std::sync::mpsc::channel();
-            let waker = Waker::from(Arc::new(StallingWaker {
-                woken: woken_tx,
-                resume: std::sync::Mutex::new(resume_rx),
-            }));
-            let mut cx = Context::from_waker(&waker);
-            // Unconstrained, so tokio's coop budget never calls the stalling waker on this thread.
-            let mut pickup =
-                std::pin::pin!(tokio::task::unconstrained(connector.reused_stream(&peer)));
+        let (stream, reused) = connector.get_stream(&peer).await.unwrap();
+        assert!(reused);
+        assert_eq!(stream.id(), id);
+    }
 
-            // The idle watcher almost always still holds the lock when the pickup first asks
-            // for it. When it let go first there is no unlock to poll inside, so try again.
-            if let Poll::Ready(reused) = pickup.as_mut().poll(&mut cx) {
-                stream = reused.expect("healthy pooled connection was dropped");
-                continue;
-            }
-            woken_rx
-                .recv_timeout(Duration::from_secs(5))
-                .expect("idle watcher should unlock the stream");
-            // The watcher's thread is now stalled inside its unlock: the lock is free, but the
-            // watcher has not yet dropped its own handle to the stream.
-            let reused = pickup.as_mut().poll(&mut cx);
-            resume_tx.send(()).unwrap();
-            assert!(
-                matches!(reused, Poll::Ready(Some(_))),
-                "healthy pooled connection was dropped"
-            );
-            return;
-        }
-        panic!("the idle watcher never held the lock when the pickup asked for it");
+    #[tokio::test]
+    async fn test_closed_or_expired_idle_streams_are_not_reused() {
+        let (peer, mut accepted) = silent_upstream().await;
+        let connector = TransportConnector::new(None);
+
+        let stream = connector.new_stream(&peer).await.unwrap();
+        connector.release_stream(stream, peer.reuse_hash(), None);
+        // The server closes it while it is idle.
+        drop(accepted.recv().await.unwrap());
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let (_, reused) = connector.get_stream(&peer).await.unwrap();
+        assert!(!reused, "a connection that the server closed is not reused");
+
+        let stream = connector.new_stream(&peer).await.unwrap();
+        connector.release_stream(stream, peer.reuse_hash(), Some(Duration::from_millis(1)));
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let (_, reused) = connector.get_stream(&peer).await.unwrap();
+        assert!(
+            !reused,
+            "a connection whose idle timeout ended is not reused"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sweep_closes_expired_idle_streams() {
+        let (peer, mut accepted) = silent_upstream().await;
+        let connector = TransportConnector::new(None);
+        let stream = connector.new_stream(&peer).await.unwrap();
+        connector.release_stream(stream, peer.reuse_hash(), Some(Duration::from_millis(1)));
+
+        // Nobody picks it up, so the sweep closes it, which the server reads as the end.
+        let mut server_side = accepted.recv().await.unwrap();
+        let mut buf = [0; 1];
+        let read = tokio::time::timeout(SWEEP_INTERVAL * 3, server_side.read(&mut buf)).await;
+        assert!(matches!(read, Ok(Ok(0))), "not closed: {read:?}");
+    }
+
+    #[tokio::test]
+    async fn test_keepalive_pool_callback_on_eviction() {
+        let (peer, _accepted) = silent_upstream().await;
+        let evicted = Arc::new(AtomicU64::new(0));
+        let counted = evicted.clone();
+        let mut options = ConnectorOptions::new(1);
+        options.keepalive_pool_callback = Some(Arc::new(move |_| {
+            counted.fetch_add(1, Ordering::Relaxed);
+        }));
+        let connector = TransportConnector::new(Some(options));
+        let first = connector.new_stream(&peer).await.unwrap();
+        let second = connector.new_stream(&peer).await.unwrap();
+        connector.release_stream(first, peer.reuse_hash(), None);
+        assert_eq!(evicted.load(Ordering::Relaxed), 0);
+        // The pool holds one connection, so the first one leaves it.
+        connector.release_stream(second, peer.reuse_hash(), None);
+        assert_eq!(evicted.load(Ordering::Relaxed), 1);
     }
 
     // 192.0.2.1 is TEST-NET-1 (RFC 5737) — SYN packets are silently

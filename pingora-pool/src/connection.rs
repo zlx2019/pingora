@@ -52,12 +52,13 @@ impl ConnectionMeta {
 }
 
 struct PoolConnection<S> {
-    pub notify_use: oneshot::Sender<bool>,
+    /// Tells the idle watcher that the connection is picked up; `None` without a watcher.
+    pub notify_use: Option<oneshot::Sender<bool>>,
     pub connection: S,
 }
 
 impl<S> PoolConnection<S> {
-    pub fn new(notify_use: oneshot::Sender<bool>, connection: S) -> Self {
+    pub fn new(notify_use: Option<oneshot::Sender<bool>>, connection: S) -> Self {
         PoolConnection {
             notify_use,
             connection,
@@ -66,7 +67,9 @@ impl<S> PoolConnection<S> {
 
     pub fn release(self) -> S {
         // notify the idle watcher to release the connection
-        let _ = self.notify_use.send(true);
+        if let Some(notify_use) = self.notify_use {
+            let _ = notify_use.send(true);
+        }
         // wait for the watcher to release
         self.connection
     }
@@ -177,6 +180,37 @@ impl<T> PoolNode<T> {
         None
         // _queue_lock drops here
     }
+
+    /// Remove the items that `keep` rejects, and return them.
+    pub fn retain(&self, mut keep: impl FnMut(&mut T) -> bool) -> Vec<(ID, T)> {
+        let mut removed = Vec::new();
+        {
+            let mut connections = self.connections.lock();
+            let rejected: Vec<ID> = connections
+                .iter_mut()
+                .filter_map(|(id, item)| (!keep(item)).then_some(*id))
+                .collect();
+            for id in rejected {
+                if let Some(item) = connections.remove(&id) {
+                    removed.push((id, item));
+                }
+            }
+        }
+
+        // Like remove(): insert and get may use the queue in parallel meanwhile.
+        let _queue_lock = self.hot_queue_remove_lock.lock();
+        for _ in 0..self.hot_queue.len() {
+            let Some((id, mut item)) = self.hot_queue.pop() else {
+                break;
+            };
+            if keep(&mut item) {
+                self.insert(id, item);
+            } else {
+                removed.push((id, item));
+            }
+        }
+        removed
+    }
 }
 
 type Pool<S> = PoolNode<PoolConnection<S>>;
@@ -244,16 +278,16 @@ impl<S> ConnectionPool<S> {
     }
 
     // only remove from the pool because lru already removed it
-    fn pop_evicted(&self, meta: &ConnectionMeta) {
+    fn pop_evicted(&self, meta: &ConnectionMeta) -> Option<S> {
         let pool_node = match self.pools.get(&meta.key) {
             Some(v) => v.value().clone(),
             None => {
                 warn!("Fail to get pool node for {meta:?}");
-                return;
+                return None;
             } // nothing to pop, should return error?
         };
 
-        pool_node.remove(meta.id);
+        let removed = pool_node.remove(meta.id);
         debug!("evict fd: {} from key {}", meta.id, meta.key);
 
         // Clean up the PoolNode entry if it is now empty, to prevent unbounded
@@ -263,6 +297,7 @@ impl<S> ConnectionPool<S> {
         if pool_node.is_empty() {
             self.try_remove_empty_node(meta.key);
         }
+        removed.map(|removed| removed.connection)
     }
 
     pub fn pop_closed(&self, meta: &ConnectionMeta) {
@@ -308,9 +343,50 @@ impl<S> ConnectionPool<S> {
             self.pop_evicted(meta);
         }
         let (notify_use, watch_use) = oneshot::channel();
-        let connection = PoolConnection::new(notify_use, connection);
+        let connection = PoolConnection::new(Some(notify_use), connection);
         self.insert_pool_connection(meta.key, meta.id, connection);
         (notify_close, watch_use)
+    }
+
+    /// Release a connection to this pool for reuse, without a watcher: the caller checks it
+    /// when [Self::get()] hands it back, and drops the ones that went bad meanwhile with
+    /// [Self::retain()].
+    ///
+    /// Returns the connections that the pool evicted to stay within its size.
+    pub fn put_unwatched(&self, meta: &ConnectionMeta, connection: S) -> Vec<S> {
+        let evicted = self.lru.add_unwatched(meta.id, meta.clone());
+        let evicted = evicted
+            .iter()
+            .filter_map(|meta| self.pop_evicted(meta))
+            .collect();
+        let connection = PoolConnection::new(None, connection);
+        self.insert_pool_connection(meta.key, meta.id, connection);
+        evicted
+    }
+
+    /// Drop the connections in this pool that `keep` rejects.
+    ///
+    /// Meant for connections released with [Self::put_unwatched()], which nothing checks while
+    /// they are idle.
+    pub fn retain(&self, mut keep: impl FnMut(&mut S) -> bool) {
+        // Clone the nodes out first, so that no shard of the map stays locked meanwhile.
+        let nodes: Vec<_> = self
+            .pools
+            .iter()
+            .map(|node| (*node.key(), node.value().clone()))
+            .collect();
+        for (key, node) in nodes {
+            let removed = node.retain(|pooled| keep(&mut pooled.connection));
+            // Forget them in the LRU while they are still open: once one closes, a new
+            // connection may get its ID.
+            for (id, _) in &removed {
+                self.lru.pop(id);
+            }
+            drop(removed);
+            if node.is_empty() {
+                self.try_remove_empty_node(key);
+            }
+        }
     }
 
     /// Actively monitor the health of a connection that is already released to this pool
@@ -547,6 +623,50 @@ mod tests {
         let found_a1 = cp.get(&meta1.key).unwrap();
         assert_eq!(found_a1, value3);
         assert_eq!(cp.get(&meta1.key), None)
+    }
+
+    #[test]
+    fn test_put_unwatched_returns_evicted() {
+        let cp: ConnectionPool<String> = ConnectionPool::new(2);
+        let evicted = cp.put_unwatched(&ConnectionMeta::new(101, 1), "v1".to_string());
+        assert!(evicted.is_empty());
+        let evicted = cp.put_unwatched(&ConnectionMeta::new(102, 2), "v2".to_string());
+        assert!(evicted.is_empty());
+        // over the size, the oldest goes
+        let evicted = cp.put_unwatched(&ConnectionMeta::new(101, 3), "v3".to_string());
+        assert_eq!(evicted, ["v1"]);
+
+        assert_eq!(cp.get(&101).as_deref(), Some("v3"));
+        assert_eq!(cp.get(&101), None);
+        assert_eq!(cp.get(&102).as_deref(), Some("v2"));
+    }
+
+    #[test]
+    fn test_retain() {
+        // More connections under one key than its hot queue holds, so that some overflow.
+        let cp: ConnectionPool<ID> = ConnectionPool::new(64);
+        for id in 0..40 {
+            assert!(cp
+                .put_unwatched(&ConnectionMeta::new(101, id), id)
+                .is_empty());
+        }
+        assert!(cp
+            .put_unwatched(&ConnectionMeta::new(102, 99), 99)
+            .is_empty());
+
+        cp.retain(|id| *id % 2 == 0 && *id != 99);
+
+        let mut kept = Vec::new();
+        while let Some(id) = cp.get(&101) {
+            kept.push(id);
+        }
+        kept.sort();
+        assert_eq!(kept, (0..40).filter(|id| id % 2 == 0).collect::<Vec<ID>>());
+        assert_eq!(cp.get(&102), None);
+        assert!(
+            !pool_contains(&cp, 102),
+            "the node that retain emptied is removed"
+        );
     }
 
     #[tokio::test]

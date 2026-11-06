@@ -21,22 +21,25 @@ use std::sync::Arc;
 use tokio::sync::Notify;
 
 pub struct Node<T> {
-    pub close_notifier: Arc<Notify>,
+    /// Notified when the node is evicted; `None` when nothing waits for that.
+    pub close_notifier: Option<Arc<Notify>>,
     pub meta: T,
     order: u64,
 }
 
 impl<T> Node<T> {
-    pub fn new(meta: T) -> Self {
+    pub fn new(meta: T, close_notifier: Option<Arc<Notify>>) -> Self {
         Node {
-            close_notifier: Arc::new(Notify::new()),
+            close_notifier,
             meta,
             order: 0,
         }
     }
 
     pub fn notify_close(&self) {
-        self.close_notifier.notify_one();
+        if let Some(notifier) = &self.close_notifier {
+            notifier.notify_one();
+        }
     }
 }
 
@@ -156,9 +159,14 @@ where
     }
 
     pub fn add(&self, key: K, meta: T) -> (Arc<Notify>, Vec<T>) {
-        let node = Node::new(meta);
-        let notifier = node.close_notifier.clone();
+        let notifier = Arc::new(Notify::new());
+        let node = Node::new(meta, Some(notifier.clone()));
         (notifier, self.put(key, node))
+    }
+
+    /// Like [`Self::add`], for an entry whose eviction nothing waits for.
+    pub fn add_unwatched(&self, key: K, meta: T) -> Vec<T> {
+        self.put(key, Node::new(meta, None))
     }
 
     pub fn pop(&self, key: &K) -> Option<Node<T>> {
