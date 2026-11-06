@@ -318,51 +318,56 @@ where
             }
         }
         if h2c || matches!(stream.selected_alpn_proto(), Some(ALPN::H2)) {
-            // create a shared connection digest
-            let digest = Arc::new(Digest {
-                ssl_digest: stream.get_ssl_digest(),
-                // TODO: log h2 handshake time
-                timing_digest: stream.get_timing_digest(),
-                proxy_digest: stream.get_proxy_digest(),
-                socket_digest: stream.get_socket_digest(),
-            });
+            // Boxed: the HTTP/2 handshake and accept loop need a few KiB, which this future would
+            // otherwise hold for every connection, HTTP/1.x ones included.
+            Box::pin(async move {
+                // create a shared connection digest
+                let digest = Arc::new(Digest {
+                    ssl_digest: stream.get_ssl_digest(),
+                    // TODO: log h2 handshake time
+                    timing_digest: stream.get_timing_digest(),
+                    proxy_digest: stream.get_proxy_digest(),
+                    socket_digest: stream.get_socket_digest(),
+                });
 
-            let h2_options = self.h2_options();
-            let h2_conn = match server::handshake(stream, h2_options).await {
-                Err(e) => {
-                    error!("H2 handshake error {e}");
-                    return None;
-                }
-                Ok(c) => c,
-            };
+                let h2_options = self.h2_options();
+                let h2_conn = match server::handshake(stream, h2_options).await {
+                    Err(e) => {
+                        error!("H2 handshake error {e}");
+                        return;
+                    }
+                    Ok(c) => c,
+                };
 
-            // The accept-loop body — including the graceful-shutdown state
-            // machine — lives in `server::accept_downstream_sessions` so that
-            // the same code path is exercised by tests in `protocols::http::v2`.
-            let app = self.clone();
-            let shutdown_for_session = shutdown.clone();
-            let h2_idle_timeout = self.server_options().and_then(|o| o.h2_idle_timeout);
-            server::accept_downstream_sessions(
-                h2_conn,
-                digest,
-                shutdown.clone(),
-                h2_idle_timeout,
-                |h2_stream, guard| {
-                    let app = app.clone();
-                    let shutdown = shutdown_for_session.clone();
-                    pingora_runtime::current_handle().spawn(async move {
-                        // hold `guard` for the session's lifetime so the accept
-                        // loop's idle timeout sees this connection as busy.
-                        let _guard = guard;
-                        // Note, `PersistentSettings` not currently relevant for h2
-                        app.process_new_http(
-                            ServerSession::<DS>::new_http2_with_custom_session(h2_stream),
-                            &shutdown,
-                        )
-                        .await;
-                    });
-                },
-            )
+                // The accept-loop body — including the graceful-shutdown state
+                // machine — lives in `server::accept_downstream_sessions` so that
+                // the same code path is exercised by tests in `protocols::http::v2`.
+                let app = self.clone();
+                let shutdown_for_session = shutdown.clone();
+                let h2_idle_timeout = self.server_options().and_then(|o| o.h2_idle_timeout);
+                server::accept_downstream_sessions(
+                    h2_conn,
+                    digest,
+                    shutdown.clone(),
+                    h2_idle_timeout,
+                    |h2_stream, guard| {
+                        let app = app.clone();
+                        let shutdown = shutdown_for_session.clone();
+                        pingora_runtime::current_handle().spawn(async move {
+                            // hold `guard` for the session's lifetime so the accept
+                            // loop's idle timeout sees this connection as busy.
+                            let _guard = guard;
+                            // Note, `PersistentSettings` not currently relevant for h2
+                            app.process_new_http(
+                                ServerSession::<DS>::new_http2_with_custom_session(h2_stream),
+                                &shutdown,
+                            )
+                            .await;
+                        });
+                    },
+                )
+                .await;
+            })
             .await;
         } else if custom || matches!(stream.selected_alpn_proto(), Some(ALPN::Custom(_))) {
             return self.clone().process_custom_session(stream, shutdown).await;
@@ -371,30 +376,37 @@ where
             let h1_header_count_limit = self
                 .server_options()
                 .map_or_else(HeaderLimit::default, |opts| opts.h1_header_count_limit);
-            let mut session = ServerSession::<DS>::new_http1_with_custom_session(stream);
-            if *shutdown.borrow() {
-                // stop downstream from reusing if this service is shutting down soon
-                session.set_keepalive(None);
-            } else {
-                // default 60s
-                session.set_keepalive(Some(60));
-            }
-            session.set_keepalive_reuses_remaining(
-                self.server_options()
-                    .and_then(|opts| opts.keepalive_request_limit),
-            );
-            session.set_h1_header_count_limit(h1_header_count_limit);
-
-            let mut result = self.process_new_http(session, shutdown).await;
-            while let Some((stream, persistent_settings)) = result.map(|r| r.consume()) {
+            // Each session moves into the future of `process_new_http` before it is awaited. The
+            // blocks end the scopes of the sessions there; otherwise this future would keep room
+            // for both of them for as long as the connection lasts.
+            let mut result = {
                 let mut session = ServerSession::<DS>::new_http1_with_custom_session(stream);
-                // Keepalive reuse creates a fresh session, so reapply listener parser settings.
-                session.set_h1_header_count_limit(h1_header_count_limit);
-                if let Some(persistent_settings) = persistent_settings {
-                    persistent_settings.apply_to_session(&mut session);
+                if *shutdown.borrow() {
+                    // stop downstream from reusing if this service is shutting down soon
+                    session.set_keepalive(None);
+                } else {
+                    // default 60s
+                    session.set_keepalive(Some(60));
                 }
-
-                result = self.process_new_http(session, shutdown).await;
+                session.set_keepalive_reuses_remaining(
+                    self.server_options()
+                        .and_then(|opts| opts.keepalive_request_limit),
+                );
+                session.set_h1_header_count_limit(h1_header_count_limit);
+                self.process_new_http(session, shutdown)
+            }
+            .await;
+            while let Some((stream, persistent_settings)) = result.map(|r| r.consume()) {
+                result = {
+                    let mut session = ServerSession::<DS>::new_http1_with_custom_session(stream);
+                    // Keepalive reuse creates a fresh session, so reapply listener parser settings.
+                    session.set_h1_header_count_limit(h1_header_count_limit);
+                    if let Some(persistent_settings) = persistent_settings {
+                        persistent_settings.apply_to_session(&mut session);
+                    }
+                    self.process_new_http(session, shutdown)
+                }
+                .await;
             }
         }
         None
