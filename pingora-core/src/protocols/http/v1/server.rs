@@ -366,6 +366,8 @@ impl HttpSession {
                             _ => Version::HTTP_09,
                         });
 
+                        // Before the split below, after which both halves share the buffer.
+                        let capacity = buf.capacity();
                         // Detach bytes beyond the header in O(1). Keeping them as owned BytesMut
                         // allows body parsing and subsequent pipelined sessions to continue
                         // splitting the same allocation instead of copying the shrinking suffix.
@@ -384,7 +386,7 @@ impl HttpSession {
                             }
                             rest
                         };
-                        let buf = buf.freeze();
+                        let buf = freeze_header(buf, capacity);
 
                         for header in header_refs {
                             let header_name = header.get_name_bytes(&buf);

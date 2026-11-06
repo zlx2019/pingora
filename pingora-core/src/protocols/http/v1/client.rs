@@ -315,7 +315,10 @@ impl HttpSession {
                             return self.fail_response_header_read(e);
                         }
 
-                        let buf = std::mem::take(&mut self.response_header_read_buf).freeze();
+                        // The bytes read past the header, the start of the body, go along.
+                        let read = std::mem::take(&mut self.response_header_read_buf);
+                        let capacity = read.capacity();
+                        let buf = freeze_header(read, capacity);
 
                         for header in header_refs {
                             let header_name = header.get_name_bytes(&buf);

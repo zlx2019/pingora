@@ -14,6 +14,7 @@
 
 //! Common functions and constants
 
+use bytes::{Bytes, BytesMut};
 use http::{header, HeaderValue};
 use log::{debug, warn};
 use pingora_error::{Error, ErrorType::*, Result};
@@ -425,6 +426,18 @@ pub(crate) fn content_length_is_single_token(headers: &HMap) -> bool {
     }
 }
 
+/// Freezes the bytes of a parsed header, read into a buffer of `capacity` bytes. Header values
+/// point into that buffer and keep all of it for as long as the session lasts, which is the
+/// whole connection once it is upgraded, so bytes that fill less than half of it move to a
+/// buffer of their own size.
+pub(super) fn freeze_header(buf: BytesMut, capacity: usize) -> Bytes {
+    if capacity >= 2 * buf.len() {
+        Bytes::copy_from_slice(&buf)
+    } else {
+        buf.freeze()
+    }
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
@@ -433,6 +446,32 @@ mod test {
         StatusCode, Version,
     };
     use rstest::rstest;
+
+    #[test]
+    fn test_freeze_header_moves_small_headers() {
+        let header = b"GET / HTTP/1.1\r\nHost: a\r\n\r\n";
+        let mut sparse = BytesMut::with_capacity(INIT_HEADER_BUF_SIZE);
+        sparse.extend_from_slice(header);
+        let (start, capacity) = (sparse.as_ptr(), sparse.capacity());
+        let moved = freeze_header(sparse, capacity);
+        assert_eq!(&moved[..], header);
+        assert_ne!(
+            moved.as_ptr(),
+            start,
+            "a small header gets a buffer of its own"
+        );
+
+        let mut dense = BytesMut::with_capacity(header.len() + 4);
+        dense.extend_from_slice(header);
+        let (start, capacity) = (dense.as_ptr(), dense.capacity());
+        let kept = freeze_header(dense, capacity);
+        assert_eq!(&kept[..], header);
+        assert_eq!(
+            kept.as_ptr(),
+            start,
+            "a header that fills its buffer keeps it"
+        );
+    }
 
     #[test]
     fn test_validate_content_length() {
