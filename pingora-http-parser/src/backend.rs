@@ -22,21 +22,34 @@ pub const CAPABILITIES: Capabilities = Capabilities {
     non_ascii_response_header_names: cfg!(feature = "patched_http1"),
 };
 
+/// Where the parser writes one header field. The fields stay uninitialized
+/// until the parser writes them, so that each parse does not first write the
+/// whole inline storage; the patched parser only fills initialized fields.
+#[cfg(not(feature = "patched_http1"))]
+type Slot<'buf> = std::mem::MaybeUninit<httparse::Header<'buf>>;
+#[cfg(feature = "patched_http1")]
+type Slot<'buf> = httparse::Header<'buf>;
+
+#[cfg(not(feature = "patched_http1"))]
+const EMPTY_SLOT: Slot<'static> = std::mem::MaybeUninit::uninit();
+#[cfg(feature = "patched_http1")]
+const EMPTY_SLOT: Slot<'static> = httparse::EMPTY_HEADER;
+
 /// Caller-owned storage used while parsing one HTTP/1 head.
 ///
 /// The inline storage preserves Pingora's allocation-free common path. The
 /// expanded storage is used only when the configured limit permits more fields
 /// and the inline parse reports [`Error::TooManyHeaders`].
 pub struct HeaderStorage<'buf> {
-    inline: [httparse::Header<'buf>; INLINE_HEADER_CAPACITY],
-    expanded: Vec<httparse::Header<'buf>>,
+    inline: [Slot<'buf>; INLINE_HEADER_CAPACITY],
+    expanded: Vec<Slot<'buf>>,
 }
 
 impl HeaderStorage<'_> {
     /// Create empty parser storage.
     pub fn new() -> Self {
         Self {
-            inline: [httparse::EMPTY_HEADER; INLINE_HEADER_CAPACITY],
+            inline: [EMPTY_SLOT; INLINE_HEADER_CAPACITY],
             expanded: Vec::new(),
         }
     }
@@ -194,26 +207,29 @@ fn expanded_capacity(limit: HeaderLimit, current: usize, buf: &[u8]) -> Option<u
 }
 
 fn prepare_expanded_headers<'buf>(
-    headers: &mut Vec<httparse::Header<'buf>>,
+    headers: &mut Vec<Slot<'buf>>,
     capacity: usize,
 ) -> Result<(), Error> {
     headers.clear();
     headers
         .try_reserve_exact(capacity)
         .map_err(|_| Error::TooManyHeaders)?;
-    headers.resize(capacity, httparse::EMPTY_HEADER);
+    headers.resize(capacity, EMPTY_SLOT);
     Ok(())
 }
 
 fn parse_request_once<'headers, 'buf>(
-    headers: &'headers mut [httparse::Header<'buf>],
+    headers: &'headers mut [Slot<'buf>],
     buf: &'buf [u8],
 ) -> Result<Status<Request<'headers, 'buf>>, Error> {
+    #[cfg(feature = "patched_http1")]
     let mut request = httparse::Request::new(headers);
+    #[cfg(not(feature = "patched_http1"))]
+    let mut request = httparse::Request::new(&mut []);
     #[cfg(feature = "patched_http1")]
     let result = request.parse_unchecked(buf);
     #[cfg(not(feature = "patched_http1"))]
-    let result = request.parse(buf);
+    let result = request.parse_with_uninit_headers(buf, headers);
 
     match result {
         Ok(httparse::Status::Complete(consumed)) => {
@@ -256,12 +272,20 @@ fn response_parser(config: ResponseParserConfig) -> httparse::ParserConfig {
 }
 
 fn parse_response_once<'headers, 'buf>(
-    headers: &'headers mut [httparse::Header<'buf>],
+    headers: &'headers mut [Slot<'buf>],
     buf: &'buf [u8],
     config: ResponseParserConfig,
 ) -> Result<Status<Response<'headers, 'buf>>, Error> {
+    let parser = response_parser(config);
+    #[cfg(feature = "patched_http1")]
     let mut response = httparse::Response::new(headers);
-    match response_parser(config).parse_response(&mut response, buf) {
+    #[cfg(not(feature = "patched_http1"))]
+    let mut response = httparse::Response::new(&mut []);
+    #[cfg(feature = "patched_http1")]
+    let result = parser.parse_response(&mut response, buf);
+    #[cfg(not(feature = "patched_http1"))]
+    let result = parser.parse_response_with_uninit_headers(&mut response, buf, headers);
+    match result {
         Ok(httparse::Status::Complete(consumed)) => {
             Ok(Status::Complete(consumed, Response { inner: response }))
         }
